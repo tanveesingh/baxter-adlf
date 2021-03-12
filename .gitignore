@@ -1,0 +1,9 @@
+*.pyc
+.project
+.pydevproject
+.buildpath
+.settings/
+**/__pycache__/
+build/*
+configs/*
+.idea/*

@@ -1,0 +1,4 @@
+spark.driver.memory,30G
+spark.executor.memory,60G
+spark.num.executors,4
+spark.executor.cores,3

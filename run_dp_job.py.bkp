@@ -1,0 +1,455 @@
+import boto3
+import psycopg2
+import hub_config as hub
+import sys
+import os
+import re
+import time
+from subprocess import Popen, PIPE
+import datetime as datetime
+import subprocess
+import logging
+
+
+
+def setup_custom_logger(name, region, etl_prcs_name, timestamp, part_val=None):
+    try:
+        ct_dt = datetime.datetime.now()
+        ct_dt_str = ct_dt.strftime('%Y%m%d')
+        log = logging.getLogger(name)
+        log.setLevel(logging.INFO)
+        if part_val is None:
+            log_filename = etl_prcs_name + "_" + timestamp + ".log"
+        else:
+            log_filename = etl_prcs_name + "_" + part_val + "_" + timestamp + ".log"
+        log_filedir = hub.log_path + region.upper() + "/" +ct_dt_str
+        log_filename = log_filedir + "/" + log_filename
+        os.makedirs(os.path.dirname(log_filename), exist_ok=True)
+        fh = logging.FileHandler(log_filename, mode='a', delay=False)
+        fh.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        log.addHandler(fh)
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(formatter)
+        log.addHandler(handler)
+        return log
+    except Exception as err:
+        raise Exception(err)
+
+
+## Function to open a RDS Connection ##
+def get_rds_con(self):
+    try:
+        rds = boto3.client('rds', region_name=hub.rds_region)
+        password = rds.generate_db_auth_token(DBHostname=hub.rds_host, Port=hub.rds_port, DBUsername=hub.rds_user,
+                                              Region=hub.rds_region)
+        conn = psycopg2.connect(user=hub.rds_user, password=password, host=hub.rds_host, database=hub.rds_database,
+                                options=f'-c search_path={hub.rds_schema}')
+        return conn
+    except Exception as err:
+        print(err)
+
+
+## Function to close a RDS Connection ##
+def close_rds_con(conn):
+    if conn is not None:
+        conn.close()
+        print("Connection is closed")
+
+
+## Function is create raw_consolidated path based on database and table name ##
+def main():
+    try:
+        ct_dt = datetime.datetime.now()
+        timestamp = ct_dt.strftime('%Y%m%d%H%M%S')
+        arg_list = sys.argv
+        job_id = arg_list[1]
+        prcs_name = arg_list[2]
+        schd_name = arg_list[3]
+        btch_name = arg_list[4]
+        sbjct_area_name = arg_list[5]
+        region = arg_list[6]
+        bucket_name = hub.jde_bucket_name
+        part_val = None
+        connection = get_rds_con(hub)
+        cursor = connection.cursor()
+        sql = "select opn_tag_val from c_opn_config op join c_job_config job on op.job_id = job.job_id and op.opn_id = job.opn_id where job.job_id ="+job_id+" and job.actv_ind = 'Y' and op.opn_tag_descr ='table_name' and op.opn_class_val = 'read_glue'"
+        cursor.execute(sql)
+        res_set = cursor.fetchall()     
+        if len(res_set) == 1:
+            table_name = res_set[0][0]
+            print("Table_Name: ",table_name)
+            etl_prcs_id, error = get_prcs_id(prcs_name, region)
+            sql = "select parm_val from etl_prcs_parm epp where parm_name = 'jp_LoadType' and etl_prcs_id = " + etl_prcs_id + " and actv_ind = 'Y'"
+            cursor.execute(sql)
+            res_set = cursor.fetchall()
+            LoadType = res_set[0][0]
+            sql = "select TO_CHAR (max(cdc_upr_dtm ),'YYYY-MM-DD HH24:MI:SS'),TO_CHAR (current_timestamp,'YYYY-MM-DD HH24:MI:SS') from etl_prcs_run where etl_prcs_id = (select etl_prcs_id from etl_prcs where etl_prcs_name = '" + prcs_name + "' and rgn_cd = '" + region + "') and RUN_STS_CD = 1"
+            cursor.execute(sql)
+            res_set = cursor.fetchall()
+            cdc_lower_dtm = res_set[0][0]
+            if (cdc_lower_dtm is None) or (cdc_lower_dtm == ''):
+                cdc_lower_dtm = '1950-12-31 00:00:00'
+            cdc_lower_dtm = cdc_lower_dtm.split()
+            cdc_lower_dtm = cdc_lower_dtm[0] + 'T' + cdc_lower_dtm[1]
+            print("CDC_LOWER_DTM: ", cdc_lower_dtm)
+            cdc_upper_dtm = res_set[0][1]
+            cdc_upper_dtm = cdc_upper_dtm.split()
+            cdc_upper_dtm = cdc_upper_dtm[0] + 'T' + cdc_upper_dtm[1]
+            print("CDC_UPPER_DTM: ", cdc_upper_dtm)
+            if LoadType == 'FULL' or cdc_lower_dtm == '1950-12-31 00:00:00':
+                print("Full Load Scenario")
+                trigger_command()
+            else:
+                sql = "select opn_tag_val from c_opn_config where  job_id =" + job_id + " and trim(opn_tag_descr) ='file_path' and trim(opn_class_val) = 'cleanup_dir'"
+                cursor.execute(sql)
+                res_set = cursor.fetchall()
+                if len(res_set) >= 1:
+                    file_path_list = res_set[0][0].split("|")
+                else:
+                    file_path_list = []
+                sql = "select parm_val from etl_prcs_parm where etl_prcs_id  = (select etl_prcs_id from etl_prcs where etl_prcs_name = '"+prcs_name+"' and rgn_cd = '"+region+"') and parm_name = 'jp_DBName'"
+                cursor.execute(sql)
+                res_set = cursor.fetchall()
+                if 'ladta' in res_set[0][0]:
+                    db_name = 'LADTA'
+                elif 'lactl' in res_set[0][0]:
+                    db_name = 'LACTL'
+                elif 'apdta' in res_set[0][0]:
+                    db_name = 'APDTA'
+                elif 'apctl' in res_set[0][0]:
+                    db_name = 'APCTL'
+                elif 'ladd' in res_set[0][0]:
+                    db_name = 'LADD'
+                elif 'nactl' in res_set[0][0]:
+                    db_name = 'NACTL'
+                elif 'nadta' in res_set[0][0]:
+                    db_name = 'NADTA'
+                elif 'nadd' in res_set[0][0]:
+                    db_name = 'NADD'
+                elif 'apdd' in res_set[0][0]:
+                    db_name = 'APDD'
+                print("DB Name: ",db_name)
+                connection.commit()
+                close_rds_con(connection)
+                prefix= "raw-consolidated/"+db_name+"/"+table_name+"/"
+                fetch_command = "aws s3api list-objects-v2 --bucket " + bucket_name + " --prefix " + prefix + " --query 'Contents[?(LastModified > `" + cdc_lower_dtm + "` && LastModified <= `" + cdc_upper_dtm + "`)].[Key]' --output text"
+                modified_files = subprocess.getoutput(fetch_command)
+                files_list = []
+                for file in  modified_files.split('\n'):
+                    if '.parquet' in file:
+                        files_list.append(file)
+                if len(files_list) > 0:
+                    print("Files are Present in the Window")
+                    trigger_command()
+                else:
+                    log = setup_custom_logger(__name__, region, prcs_name, timestamp, part_val)
+                    log.info("Table_Name: "+str(table_name))
+                    log.info("DB Name: "+str(db_name))
+                    log.info("CDC_LOWER_DTM: "+str(cdc_lower_dtm))
+                    log.info("CDC_UPPER_DTM: "+str(cdc_upper_dtm))
+                    log.warning("Files are not Present in the Window")
+                    if len(file_path_list) >= 1:
+                        for file_path in file_path_list:
+                            file_path = file_path.replace("$region",region)
+                            file_path = file_path.replace("$translate-bucket", hub.translate_bucket_name)
+                            file_path = file_path.replace("$bucket", hub.bucket_name)
+                            file_path = file_path.replace("$jde-bucket", hub.jde_bucket_name)
+                            file_path = file_path.replace("$outbound-bucket", hub.outbound_bucket_name)
+                            s3_rm_cmd = "aws s3 rm " + file_path + " --recursive --quiet --only-show-errors"
+                            os.system(s3_rm_cmd)
+                    check_status(prcs_name,region,log)
+                    etl_prcs_run_id,etl_job_run_id,error = insert_abc_entry(prcs_name,schd_name,btch_name,sbjct_area_name,region,cdc_lower_dtm,cdc_upper_dtm,log)
+                    insert_abc_job_entry(etl_job_run_id,etl_prcs_run_id,prcs_name,region,cdc_upper_dtm,log)
+        else:
+            trigger_command()           
+    except Exception as err:
+        print(err)
+        sys.exit(-1)
+
+
+def trigger_command():
+    try:
+        arg_list = sys.argv
+        if len(arg_list) == 7:
+            job_id = arg_list[1]
+            prcs_name = arg_list[2]
+            schd_name = arg_list[3]
+            btch_name = arg_list[4]
+            sbjct_area_name = arg_list[5]
+            region = arg_list[6]
+            application_args = " --job_id {job_id} --prcs_name {prcs_name} --schd_name {schd_name} --btch_name {btch_name} --sbjct_area_name {sbjct_area_name} --region {region}".format(job_id = job_id, prcs_name = prcs_name,schd_name = schd_name,btch_name = btch_name,sbjct_area_name = sbjct_area_name, region = region)
+        elif len(arg_list) == 8:
+            job_id = arg_list[1]
+            prcs_name = arg_list[2]
+            schd_name = arg_list[3]
+            btch_name = arg_list[4]
+            sbjct_area_name = arg_list[5]
+            region = arg_list[6]
+            memory_config = arg_list[7]
+            application_args = " --job_id {job_id} --prcs_name {prcs_name} --schd_name {schd_name} --btch_name {btch_name} --sbjct_area_name {sbjct_area_name} --region {region} --memory_config {memory_config} ".format(job_id = job_id, prcs_name = prcs_name,schd_name = schd_name,btch_name = btch_name,sbjct_area_name = sbjct_area_name, region = region, memory_config = memory_config)
+        elif len(arg_list) == 9:
+            job_id = arg_list[1]
+            prcs_name = arg_list[2]
+            schd_name = arg_list[3]
+            btch_name = arg_list[4]
+            sbjct_area_name = arg_list[5]
+            region = arg_list[6]
+            o_date = arg_list[7]
+            reporting_code = arg_list[8]
+            application_args = " --job_id {job_id} --prcs_name {prcs_name} --schd_name {schd_name} --btch_name {btch_name} --sbjct_area_name {sbjct_area_name} --region {region} --o_date {o_date} --reporting_code {reporting_code} ".format(job_id = job_id, prcs_name = prcs_name,schd_name = schd_name,btch_name = btch_name,sbjct_area_name = sbjct_area_name, region = region, o_date = o_date, reporting_code = reporting_code)
+        elif len(arg_list) == 10:
+            job_id = arg_list[1]
+            prcs_name = arg_list[2]
+            schd_name = arg_list[3]
+            btch_name = arg_list[4]
+            sbjct_area_name = arg_list[5]
+            region = arg_list[6]
+            memory_config = arg_list[7]
+            o_date = arg_list[8]
+            reporting_code = arg_list[9]
+            application_args = " --job_id {job_id} --prcs_name {prcs_name} --schd_name {schd_name} --btch_name {btch_name} --sbjct_area_name {sbjct_area_name} --region {region} --memory_config {memory_config} --o_date {o_date} --reporting_code {reporting_code} ".format(job_id = job_id, prcs_name = prcs_name,schd_name = schd_name,btch_name = btch_name,sbjct_area_name = sbjct_area_name, region = region, memory_config = memory_config, o_date = o_date, reporting_code = reporting_code)
+        else:
+            print("Incorrect number of arguments")
+            sys.exit(-1)
+        
+        cwd = '/home/hadoop/Framework/Data_Processing/SparkHub'
+        cmd = """spark-submit --packages net.snowflake:snowflake-jdbc:3.8.4,net.snowflake:spark-snowflake_2.11:2.5.0-spark_2.4 --jars /usr/lib/spark/jars/httpclient-4.5.9.jar,/usr/lib/hudi/hudi-spark-bundle.jar --deploy-mode client --master yarn --py-files /home/hadoop/Framework/Data_Processing/SparkHub/hub_config.py /home/hadoop/Framework/Data_Processing/SparkHub/run.py {application_args}""".format(application_args = application_args)
+        cmd = cmd.strip()
+        exitcode = None
+        print(cmd)
+        cmd_args = re.split('[\r\n\t ]+', cmd)
+        proc = Popen(cmd_args, stdout=PIPE, stderr=PIPE)
+        std_op,std_err = proc.communicate()
+        time.sleep(2)
+        exitcode = proc.wait()
+        std_op = std_op.decode('utf-8')
+        std_err = std_err.decode('utf-8')
+        print('Exitcode: {}'.format(str(exitcode)))
+        print(std_op)
+        print(std_err)
+        if exitcode!=0:
+            sys.exit(-1)
+        else:
+            sys.exit(0)
+    except Exception as err:
+        print(err)
+        sys.exit(-1)
+
+
+
+## Function to retrieve Schedule Id for a given Schedule and Region ##
+def get_schd_id(schd_name, region,log):
+    connection = get_rds_con(hub)
+    try:
+        with connection.cursor() as cursor:
+            sql = "SELECT ETL_SCHD_ID FROM ETL_SCHD WHERE ETL_SCHD_NAME = '" + schd_name + "' AND RGN_CD = '" + region + "'"
+            cursor.execute(sql)
+            res_set = cursor.fetchall()
+            if len(res_set) != 1:
+                    log.error("Schedule does not exist or it has more than one entry for Schedule Name : {} and Region : {}".format(schd_name,region))
+                    raise Exception("Schedule does not exist or it has more than one entry for Schedule Name : {} and Region : {}".format(schd_name,region))
+            else:
+                    etl_schd_id = str(res_set[0][0])
+            return etl_schd_id,None
+    except Exception as err:
+        print(err)
+        return None,err
+
+## Function to retrieve Batch Id for a given Batch and Region ##
+def get_btch_id(btch_name, region,log):
+    connection = get_rds_con(hub)
+    try:
+        with connection.cursor() as cursor:
+            sql = "SELECT ETL_BTCH_ID FROM ETL_BTCH WHERE ETL_BTCH_NAME = '" + btch_name + "' AND RGN_CD = '" + region + "'"
+            cursor.execute(sql)
+            res_set = cursor.fetchall()
+            if len(res_set) != 1:
+                    log.error("Batch does not exist or it has more than one entry for Batch Name : {} and Region : {}".format(btch_name,region))
+                    raise Exception("Batch does not exist or it has more than one entry for Batch Name : {} and Region : {}".format(btch_name,region))
+            else:
+                    etl_btch_id = str(res_set[0][0])
+            return etl_btch_id,None
+    except Exception as err:
+        print(err)
+        return None,err
+
+## Function to retrieve Subject Area Id for a given Subject Area and Region ##
+def get_sbjct_area_id(sbjct_area_name, region,log):
+    connection = get_rds_con(hub)
+    try:
+        with connection.cursor() as cursor:
+            sql = "SELECT ETL_SBJCT_AREA_ID FROM ETL_SBJCT_AREA WHERE ETL_SBJCT_AREA_NAME = '" + sbjct_area_name + "' AND RGN_CD = '" + region + "'"
+            cursor.execute(sql)
+            res_set = cursor.fetchall()
+            if len(res_set) != 1:
+                    log.error("Subject Area does not exist or it has more than one entry for Subject Area Name : {} and Region : {}".format(sbjct_area_name,region))
+                    raise Exception("Subject Area does not exist or it has more than one entry for Subject Area Name : {} and Region : {}".format(sbjct_area_name,region))
+            else:
+                    etl_sbjct_area_id = str(res_set[0][0])
+            return etl_sbjct_area_id,None
+    except Exception as err:
+        print(err)
+        return None,err
+
+
+## Function to retrieve Process Id for a given Process and Region ##
+def get_prcs_id(prcs_name, region):
+    connection = get_rds_con(hub)
+    try:
+        with connection.cursor() as cursor:
+            sql = "SELECT ETL_PRCS_ID FROM ETL_PRCS WHERE ETL_PRCS_NAME = '" + prcs_name + "' AND RGN_CD = '" + region + "' "
+            cursor.execute(sql)
+            res_set = cursor.fetchall()
+            if len(res_set) != 1:
+                #log.error("Process does not exist or it has more than one entry for Process Name : {} and Region : {}".format(prcs_name,region))
+                raise Exception("Process does not exist or it has more than one entry for Process Name : {} and Region : {}".format(prcs_name,region))
+            else:
+                    etl_prcs_id = str(res_set[0][0])
+            return etl_prcs_id,None
+    except Exception as err:
+        print(err)
+        return None,err
+
+## Function to retrieve Job Id for a given Process and Region ##
+def get_job_id(prcs_name, region,log):
+    connection = get_rds_con(hub)
+    try:
+        with connection.cursor() as cursor:
+            sql = "SELECT ETL_JOB_ID FROM ETL_JOB WHERE ETL_PRCS_ID = (SELECT ETL_PRCS_ID FROM ETL_PRCS WHERE ETL_PRCS_NAME = '" + prcs_name + "' AND RGN_CD = '" + region + "')"
+            cursor.execute(sql)
+            res_set = cursor.fetchall()
+            if len(res_set) != 1:
+                    log.error("Job does not exist for Process Name : {} and Region : {}".format(prcs_name,region))
+                    raise Exception("Job does not exist for Process Name : {} and Region : {}".format(prcs_name,region))
+            else:
+                    etl_job_id = str(res_set[0][0])
+            return etl_job_id,None
+    except Exception as err:
+        print(err)
+        return None,err
+
+## Function to retrieve Run Ids for a given Schedule, Batch and Subject Area ##
+def get_run_ids(etl_schd_id,etl_btch_id,etl_sbjct_area_id,log):
+    connection = get_rds_con(hub)
+    try:
+        with connection.cursor() as cursor:
+            sql1 = "SELECT ETL_SCHD_RUN_ID FROM ETL_SCHD_RUN WHERE ETL_SCHD_ID =" + etl_schd_id + " and END_DTM IS NULL AND CUR_IND = 'Y'"
+            cursor.execute(sql1)
+            res_set = cursor.fetchall()
+            if len(res_set) > 1:
+                log.error("More than one Schedule is RUNNING for Schedule Id : {}".format(etl_schd_id))
+                raise Exception("More than one Schedule is RUNNING for Schedule Id : {}".format(etl_schd_id))
+            elif len(res_set) < 1:
+                log.warning("No Schedule is currently RUNNING for Schedule Id : {}. Starting Adhoc Process Execution!!".format(etl_schd_id))
+                etl_schd_run_id = '99999'
+            else:
+                etl_schd_run_id = str(res_set[0][0])
+            sql2 = "SELECT ETL_BTCH_RUN_ID FROM ETL_BTCH_RUN WHERE ETL_BTCH_ID =" + etl_btch_id + " and ETL_SCHD_ID ='" + etl_schd_id + "' and END_DTM IS NULL AND CUR_IND = 'Y'"
+            cursor.execute(sql2)
+            res_set = cursor.fetchall()
+            if len(res_set) > 1:
+                log.error("More than one Batch is RUNNING for Schedule Id : {} and Batch Id :{}".format(etl_schd_id,etl_btch_id))
+                raise Exception("More than one Batch is RUNNING for Schedule Id : {} and Batch Id :{}".format(etl_schd_id,etl_btch_id))
+            elif len(res_set) < 1:
+                log.warning("No Batch is currently RUNNING for Schedule Id : {} and Batch Id : {}. Starting Adhoc Process Execution!!".format(etl_schd_id,etl_btch_id))
+                etl_btch_run_id = '99999'
+            else:
+                etl_btch_run_id = str(res_set[0][0])
+            sql3 = "SELECT ETL_SBJCT_AREA_RUN_ID FROM ETL_SBJCT_AREA_RUN WHERE ETL_SBJCT_AREA_ID =" + etl_sbjct_area_id + " and ETL_BTCH_ID ='" + etl_btch_id + "' and ETL_SCHD_ID ='" + etl_schd_id + "' and END_DTM IS NULL AND CUR_IND = 'Y'"
+            cursor.execute(sql3)
+            res_set = cursor.fetchall()
+            if len(res_set) > 1:
+                log.error("More than one Subject Area is RUNNING for Schedule Id : {} , Batch Id : {} and Subject Area Id : {}".format(etl_schd_id,etl_btch_id,etl_sbjct_area_id))
+                raise Exception("More than one Subject Area is RUNNING for Schedule Id : {} , Batch Id : {} and Subject Area Id : {}".format(etl_schd_id,etl_btch_id,etl_sbjct_area_id))
+            elif len(res_set) < 1:
+                log.warning("No Subject Area is currently RUNNING for Schedule Id : {} , Batch Id : {} and Subject Area Id : {}. Starting Adhoc Process Execution!!".format(etl_schd_id,etl_btch_id,etl_sbjct_area_id))
+                etl_sbjct_area_run_id = '99999'
+            else:
+                etl_sbjct_area_run_id = str(res_set[0][0])
+            sql4 = "SELECT CAST(nextval('ETL_PRCS_RUN_SEQ') AS VARCHAR(20))"
+            cursor.execute(sql4)
+            res_set = cursor.fetchall()
+            etl_prcs_run_id = str(res_set[0][0])
+            sql5 = "SELECT CAST(nextval('ETL_JOB_RUN_SEQ') AS VARCHAR(20))"
+            cursor.execute(sql5)
+            res_set = cursor.fetchall()
+            etl_job_run_id = str(res_set[0][0])
+        return etl_schd_run_id,etl_btch_run_id,etl_sbjct_area_run_id,etl_prcs_run_id,etl_job_run_id,None
+    except Exception as err:
+        print(err)
+        return None,None,None,err
+
+## Function to check if the Process is Already Running ##
+def check_status(prcs_name,region,log):
+    connection = get_rds_con(hub)
+    etl_prcs_id,error = get_prcs_id(prcs_name, region)
+    try:
+        with connection.cursor() as cursor:
+            sql = "SELECT COUNT(*) FROM ETL_PRCS_RUN WHERE ETL_PRCS_ID = '" + etl_prcs_id +"' AND RUN_STS_CD = 0"
+            cursor.execute(sql)
+            res_set = cursor.fetchall()
+            if res_set[0][0] > 0:
+                log.error('Process is already running')
+                raise Exception('Process is already running')
+            else:
+                pass
+    except Exception as err:
+        print(err)
+        return err
+
+## Function to make an entry in ABC for ETL_PRCS_RUN Table ##
+def insert_abc_entry(prcs_name,schd_name,btch_name,sbjct_area_name,region,cdc_lower_dtm,cdc_upper_dtm,log):
+    ct_dt = datetime.datetime.now()
+    ct_dt_str = ct_dt.strftime('%Y-%m-%d %H:%M:%S')
+    connection = get_rds_con(hub)
+    etl_prcs_id,error = get_prcs_id(prcs_name, region)
+    etl_schd_id,error = get_schd_id(schd_name, region,log)
+    etl_btch_id,error = get_btch_id(btch_name, region,log)
+    etl_sbjct_area_id,error = get_sbjct_area_id(sbjct_area_name, region,log)
+    etl_schd_run_id, etl_btch_run_id, etl_sbjct_area_run_id,etl_prcs_run_id,etl_job_run_id,error = get_run_ids(etl_schd_id, etl_btch_id, etl_sbjct_area_id,log)
+    try:
+        with connection.cursor() as cursor:
+            sig_file_name = prcs_name + '.sig'
+            sql = "INSERT INTO ETL_PRCS_RUN(ETL_PRCS_RUN_ID,ETL_PRCS_ID,ETL_SCHD_RUN_ID,ETL_BTCH_RUN_ID,ETL_SBJCT_AREA_RUN_ID,STRT_DTM,RUN_STS_CD,RUN_STS_DESCR," \
+                      "SIG_FILE_NAME,CRT_DTM,END_DTM,UPDT_DTM,CRT_USER_ID,UPDT_USER_ID,CDC_LOW_DTM,CDC_UPR_DTM) VALUES " \
+                      "(" + etl_prcs_run_id + "," + etl_prcs_id + "," + etl_schd_run_id + "," + etl_btch_run_id + "," + etl_sbjct_area_run_id + ",'" + cdc_upper_dtm + "',1," \
+                      "'Finished','" + sig_file_name + "','" + cdc_upper_dtm +"','"+ ct_dt_str +"','"+ ct_dt_str +"','emruser','emruser','"+cdc_lower_dtm+"','"+cdc_upper_dtm+"')"
+            cursor.execute(sql)
+            connection.commit()
+            close_rds_con(connection)
+        log.info("Inserted entry in ETL_PRCS_RUN with ETL_PRCS_RUN_ID as {} and STATUS as Finished for process {}".format(etl_prcs_run_id, etl_prcs_id))
+        return etl_prcs_run_id,etl_job_run_id,None
+    except Exception as err:
+        print(err)
+    finally:
+        close_rds_con(connection)
+
+## Function to make an entry in ABC for ETL_JOB_RUN Table ##
+def insert_abc_job_entry(etl_job_run_id,etl_prcs_run_id,prcs_name,region,cdc_upper_dtm,log):
+    ct_dt = datetime.datetime.now()
+    ct_dt_str = ct_dt.strftime('%Y-%m-%d %H:%M:%S')
+    connection = get_rds_con(hub)
+    etl_job_id,error = get_job_id(prcs_name, region,log)
+    try:
+        with connection.cursor() as cursor:
+            sql = "INSERT INTO ETL_JOB_RUN(ETL_JOB_RUN_ID,ETL_JOB_ID,ETL_PRCS_RUN_ID,PARTN_VAL,STRT_DTM,RUN_STS_CD,RUN_STS_DESCR," \
+                      "CRT_DTM,END_DTM,UPDT_DTM,CRT_USER_ID,UPDT_USER_ID) VALUES " \
+                      "(" + etl_job_run_id + "," + etl_job_id + "," + etl_prcs_run_id + ",'" + 'Non-Partitioned' + "','" + cdc_upper_dtm + "',1," \
+                      "'Finished','" + cdc_upper_dtm +"','"+ ct_dt_str +"','"+ ct_dt_str + "','emruser','emruser')"
+            cursor.execute(sql)
+            connection.commit()
+
+        log.info("Inserted entry in ETL_JOB_RUN with ETL_JOB_RUN_ID as {} and STATUS as Finished for job {}".format(etl_job_run_id,etl_job_id))
+        return etl_job_run_id,None
+    except Exception as err:
+        print(err)
+    finally:
+        close_rds_con(connection)
+
+
+
+if __name__ == '__main__':
+    main()
